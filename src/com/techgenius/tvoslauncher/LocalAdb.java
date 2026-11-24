@@ -72,6 +72,9 @@ final class LocalAdb {
 
     static volatile boolean portReachable = false;
     static volatile boolean volWatchConnected = false;
+    static volatile int activeAdbPort = 5555;
+    private static final Object ADB_SESSION_LOCK = new Object();
+    static volatile boolean setupGrantInProgress = false;
     private static final android.os.Handler KEEP_ALIVE_HANDLER =
             new android.os.Handler(android.os.Looper.getMainLooper());
     private static Context keepAliveAppCtx;
@@ -79,7 +82,7 @@ final class LocalAdb {
     private static android.database.ContentObserver accSettingsObserver;
     private static volatile boolean repairInProgress = false;
     private static volatile long lastRepairAttemptMs = 0L;
-    private static final long KEEP_ALIVE_INTERVAL_MS = 12_000L;
+    private static final long KEEP_ALIVE_INTERVAL_MS = 60_000L;
     private static final long REPAIR_COOLDOWN_MS = 2_500L;
 
     private static final Runnable KEEP_ALIVE_TICK = new Runnable() {
@@ -103,6 +106,103 @@ final class LocalAdb {
 
     private LocalAdb() { }
 
+    static int getActiveAdbPort(Context c) {
+        if (c != null && activeAdbPort == 5555) {
+            int saved = c.getSharedPreferences("adb_state", Context.MODE_PRIVATE).getInt("adb_port", 5555);
+            if (saved > 0) activeAdbPort = saved;
+        }
+        return activeAdbPort > 0 ? activeAdbPort : 5555;
+    }
+
+    private static void saveActiveAdbPort(Context c, int port) {
+        if (port <= 0) return;
+        activeAdbPort = port;
+        if (c != null) {
+            try {
+                c.getSharedPreferences("adb_state", Context.MODE_PRIVATE).edit().putInt("adb_port", port).apply();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static List<Integer> getCandidateAdbPorts(Context c) {
+        List<Integer> ports = new ArrayList<>();
+        int cur = getActiveAdbPort(c);
+        if (cur > 0) ports.add(cur);
+        // Check system properties (e.g. service.adb.tcp.port, persist.adb.tcp.port)
+        String[] propNames = {"service.adb.tcp.port", "persist.adb.tcp.port", " persist.vendor.adb.tcp.port"};
+        for (String prop : propNames) {
+            int p = readSystemPropertyInt(prop.trim());
+            if (p > 0 && p <= 65535 && !ports.contains(p)) {
+                ports.add(p);
+            }
+        }
+        int[] common = {5555, 5070, 5556, 5558, 5037};
+        for (int p : common) {
+            if (!ports.contains(p)) ports.add(p);
+        }
+        // Also scan /proc/net/tcp6 and /proc/net/tcp for listening high ports if standard ports fail
+        for (int p : scanProcListeningPorts()) {
+            if (!ports.contains(p)) ports.add(p);
+        }
+        return ports;
+    }
+
+    private static int readSystemPropertyInt(String key) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            java.lang.reflect.Method m = sp.getMethod("get", String.class, String.class);
+            String val = (String) m.invoke(null, key, "");
+            if (val != null && !val.trim().isEmpty()) {
+                return Integer.parseInt(val.trim());
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    private static List<Integer> scanProcListeningPorts() {
+        List<Integer> res = new ArrayList<>();
+        String[] files = {"/proc/net/tcp6", "/proc/net/tcp"};
+        for (String path : files) {
+            File f = new File(path);
+            if (!f.exists() || !f.canRead()) continue;
+            try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    String trimmed = line.trim();
+                    if (trimmed.isEmpty() || trimmed.startsWith("sl")) continue;
+                    String[] parts = trimmed.split("\\s+");
+                    if (parts.length < 4) continue;
+                    // State 0A = TCP_LISTEN
+                    if (!"0A".equalsIgnoreCase(parts[3])) continue;
+                    String localAddr = parts[1];
+                    int colon = localAddr.lastIndexOf(':');
+                    if (colon > 0 && colon + 1 < localAddr.length()) {
+                        int port = Integer.parseInt(localAddr.substring(colon + 1), 16);
+                        if ((port >= 5000 && port <= 5600) && !res.contains(port)) {
+                            res.add(port);
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return res;
+    }
+
+    static int resolveOpenPort(Context c, String host, int timeoutMs) {
+        if (host == null || host.isEmpty()) return -1;
+        List<Integer> candidates = getCandidateAdbPorts(c);
+        for (int port : candidates) {
+            if (isPortOpen(host, port, timeoutMs)) {
+                saveActiveAdbPort(c, port);
+                return port;
+            }
+        }
+        return -1;
+    }
+
     static boolean isPaired(Context c) {
         return c != null && c.getSharedPreferences("adb_state", Context.MODE_PRIVATE).getBoolean("paired", false);
     }
@@ -119,10 +219,11 @@ final class LocalAdb {
     }
 
     static String getAdbModeLabel(Context c) {
+        int p = getActiveAdbPort(c);
         if (getAdbMode(c) == ADB_MODE_PERSISTENT) {
             return I18n.s(c,
-                    "Persistent ADB Mode (Keep port 5555 open)",
-                    "Kalıcı ADB Modu (Port 5555 açık kalır)");
+                    "Persistent ADB Mode (Keep port " + p + " open)",
+                    "Kalıcı ADB Modu (Port " + p + " açık kalır)");
         }
         return I18n.s(c,
                 "Secure Mode — WRITE_SECURE_SETTINGS & Close ADB (Recommended)",
@@ -186,7 +287,7 @@ final class LocalAdb {
 
     static boolean shouldAutoRepairAccessibility(Context c) {
         if (c == null || isIntentionalRevokeActive(c)) return false;
-        return isKeepAliveEnabled(c) || hasWriteSecureSettings(c);
+        return isKeepAliveEnabled(c);
     }
 
     static void setKeepAliveEnabled(Context c, boolean enabled) {
@@ -200,9 +301,16 @@ final class LocalAdb {
             setIntentionalRevokeActive(c, false);
             ensureKeepAliveWatchdog(c);
             checkAndRepairPermissionsIfNeeded(c, true);
-        } else if (!hasWriteSecureSettings(c)) {
+        } else {
             KEEP_ALIVE_HANDLER.removeCallbacks(KEEP_ALIVE_TICK);
             keepAliveWatchdogScheduled = false;
+            if (accSettingsObserver != null) {
+                try {
+                    c.getApplicationContext().getContentResolver().unregisterContentObserver(accSettingsObserver);
+                } catch (Throwable ignored) {
+                }
+                accSettingsObserver = null;
+            }
         }
     }
 
@@ -355,7 +463,7 @@ final class LocalAdb {
     static void checkAndRepairPermissionsIfNeeded(Context c, boolean forceNow) {
         if (c == null) return;
         final Context appCtx = c.getApplicationContext();
-        if (isIntentionalRevokeActive(appCtx)) return;
+        if (isIntentionalRevokeActive(appCtx) || setupGrantInProgress) return;
         if (!forceNow && !shouldAutoRepairAccessibility(appCtx)) return;
         if (!needsPermissionRepair(appCtx)) {
             return;
@@ -366,11 +474,12 @@ final class LocalAdb {
                 return;
             }
         }
-        // 2. If Secure Mode is selected, never connect to ADB port 5555 in the background even if ADB is enabled on the TV
+        // 2. If Secure Mode is selected, never connect to ADB port in the background even if ADB is enabled on the TV
         if (getAdbMode(appCtx) == ADB_MODE_SECURE_CLOSE) {
             return;
         }
-        // 3. Fallback to Local ADB in Persistent ADB Mode only if Keep Alive (or forceNow) is active
+        // 3. Fallback to Local ADB in Persistent ADB Mode only if Keep Alive (or forceNow) is active and already paired
+        if (!isPaired(appCtx)) return;
         if (!forceNow && !isKeepAliveEnabled(appCtx)) return;
         if (repairInProgress) return;
         long now = android.os.SystemClock.uptimeMillis();
@@ -389,6 +498,10 @@ final class LocalAdb {
             if (cb != null) cb.onResult(true, "SECURE_SETTINGS");
             return;
         }
+        if (setupGrantInProgress || !isPaired(c)) {
+            if (cb != null) cb.onResult(false, "NOT_PAIRED");
+            return;
+        }
         new Thread(() -> {
             String pkg = c.getPackageName();
             String existingAcc = "";
@@ -404,9 +517,10 @@ final class LocalAdb {
             String[] hosts = {"127.0.0.1", localLanIp()};
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 600)) continue;
+                int port = resolveOpenPort(c, h, 600);
+                if (port <= 0) continue;
                 try {
-                    runShellCommand(c, h, 5555, script);
+                    runShellCommand(c, h, port, script);
                     portReachable = true;
                     setPaired(c, true);
                     if (cb != null) cb.onResult(true, null);
@@ -479,16 +593,25 @@ final class LocalAdb {
     static void watchGeteventLines(Context c, LineListener lines, Runnable onConnected, Runnable onDisconnected,
                                    BooleanSupplier shouldRun) {
         while (shouldRun.getAsBoolean()) {
+            if (setupGrantInProgress || !isPaired(c)) {
+                try {
+                    Thread.sleep(2500L);
+                } catch (InterruptedException ie) {
+                    break;
+                }
+                continue;
+            }
             boolean connectedOnce = false;
             String[] hosts = {"127.0.0.1", localLanIp()};
             for (String host : hosts) {
-                if (!shouldRun.getAsBoolean()) break;
+                if (!shouldRun.getAsBoolean() || setupGrantInProgress) break;
                 if (host == null || host.isEmpty()) continue;
-                if (!isPortOpen(host, 5555, 600)) continue;
+                int port = resolveOpenPort(c, host, 600);
+                if (port <= 0) continue;
                 try {
                     KeyPair kp = getOrCreateKeyPair(c);
                     try (Socket s = new Socket()) {
-                        s.connect(new InetSocketAddress(host, 5555), 1500);
+                        s.connect(new InetSocketAddress(host, port), 1500);
                         s.setSoTimeout(0);
                         s.setTcpNoDelay(true);
                         DataInputStream in = new DataInputStream(s.getInputStream());
@@ -503,9 +626,8 @@ final class LocalAdb {
                             sendPacket(out, A_AUTH, ADB_AUTH_SIGNATURE, 0, sig);
                             msg = readPacket(in);
                             if (msg.command == A_AUTH) {
-                                byte[] pubKey = encodeAndroidRsaPublicKey((RSAPublicKey) kp.getPublic());
-                                sendPacket(out, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, pubKey);
-                                msg = readPacket(in);
+                                // Do not send public key from background watcher to avoid duplicate RSA prompts
+                                continue;
                             }
                         }
                         if (msg.command != A_CNXN) {
@@ -597,7 +719,7 @@ final class LocalAdb {
             if (onGranted != null) onGranted.run();
             return;
         }
-        if (getAdbMode(c) == ADB_MODE_SECURE_CLOSE) {
+        if (getAdbMode(c) == ADB_MODE_SECURE_CLOSE || setupGrantInProgress || !isPaired(c)) {
             return;
         }
         new Thread(() -> {
@@ -613,9 +735,10 @@ final class LocalAdb {
             String[] hosts = {"127.0.0.1", localLanIp()};
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 500)) continue;
+                int port = resolveOpenPort(c, h, 500);
+                if (port <= 0) continue;
                 try {
-                    runShellCommand(c, h, 5555, script);
+                    runShellCommand(c, h, port, script);
                     break;
                 } catch (Exception ignored) {
                 }
@@ -637,7 +760,7 @@ final class LocalAdb {
             boolean open = false;
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (isPortOpen(h, 5555, 500)) {
+                if (resolveOpenPort(c, h, 450) > 0) {
                     open = true;
                     break;
                 }
@@ -655,13 +778,14 @@ final class LocalAdb {
             }
             return I18n.s(c, "Secure Mode (Needs One-Time Pair to Grant Permissions)", "Güvenli Mod (İzinler İçin Tek Seferlik Eşleştirme Gerekli)");
         }
+        int p = getActiveAdbPort(c);
         boolean adbOn = isAdbSettingEnabled(c);
         boolean paired = isPaired(c);
         if (portReachable && paired) {
-            return I18n.s(c, "Connected & Paired (Port 5555 Open)", "Bağlı ve Eşleşti (Port 5555 Açık)");
+            return I18n.s(c, "Connected & Paired (Port " + p + " Open)", "Bağlı ve Eşleşti (Port " + p + " Açık)");
         }
         if (portReachable) {
-            return I18n.s(c, "Port 5555 Open · Ready to Pair", "Port 5555 Açık · Eşleşmeye Hazır");
+            return I18n.s(c, "Port " + p + " Open · Ready to Pair", "Port " + p + " Açık · Eşleşmeye Hazır");
         }
         if (adbOn && paired) {
             return I18n.s(c, "Paired · ADB Enabled", "Eşleşti · ADB Açık");
@@ -707,8 +831,8 @@ final class LocalAdb {
     }
 
     /**
-     * Closes ADB on port 5555 after granting WRITE_SECURE_SETTINGS, DUMP,
-     * and SET_VOLUME_KEY_LONG_PRESS_LISTENER, switches to Secure Mode, and verifies port 5555 is closed.
+     * Closes ADB after granting WRITE_SECURE_SETTINGS, DUMP,
+     * and SET_VOLUME_KEY_LONG_PRESS_LISTENER, switches to Secure Mode, and verifies the ADB port is closed.
      */
     static void closeAdbPort(Context c, Callback cb) {
         if (c != null) {
@@ -728,9 +852,10 @@ final class LocalAdb {
             String[] hosts = {"127.0.0.1", localLanIp()};
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 600)) continue;
+                int port = resolveOpenPort(c, h, 600);
+                if (port <= 0) continue;
                 try {
-                    runShellCommand(c, h, 5555, script);
+                    runShellCommand(c, h, port, script);
                     break;
                 } catch (Exception ignored) {
                 }
@@ -749,10 +874,10 @@ final class LocalAdb {
                 Thread.sleep(500L);
             } catch (InterruptedException ignored) {
             }
-            boolean stillOpen = isPortOpen("127.0.0.1", 5555, 350);
+            boolean stillOpen = resolveOpenPort(c, "127.0.0.1", 350) > 0;
             String lan = localLanIp();
             if (!stillOpen && lan != null && !lan.isEmpty()) {
-                stillOpen = isPortOpen(lan, 5555, 350);
+                stillOpen = resolveOpenPort(c, lan, 350) > 0;
             }
             portReachable = stillOpen;
             if (PowerService.instance != null) {
@@ -784,7 +909,7 @@ final class LocalAdb {
                 } catch (Throwable ignored) {
                 }
             }
-            if (!enabledSetting && !isAdbSettingEnabled(c) && !isPortOpen("127.0.0.1", 5555, 350)) {
+            if (!enabledSetting && !isAdbSettingEnabled(c) && resolveOpenPort(c, "127.0.0.1", 350) <= 0) {
                 if (cb != null) cb.onResult(false, "NO_PERMISSION");
                 return;
             }
@@ -792,11 +917,11 @@ final class LocalAdb {
                 Thread.sleep(550L);
             } catch (InterruptedException ignored) {
             }
-            boolean open = isPortOpen("127.0.0.1", 5555, 450);
+            boolean open = resolveOpenPort(c, "127.0.0.1", 450) > 0;
             if (!open) {
                 String lan = localLanIp();
                 if (lan != null && !lan.isEmpty()) {
-                    open = isPortOpen(lan, 5555, 450);
+                    open = resolveOpenPort(c, lan, 450) > 0;
                 }
             }
             portReachable = open;
@@ -832,134 +957,155 @@ final class LocalAdb {
             if (cb != null) cb.onResult(true, "SECURE_SETTINGS");
             return;
         }
+        if (setupGrantInProgress) {
+            return;
+        }
+        setupGrantInProgress = true;
         new Thread(() -> {
-            String pkg = c.getPackageName();
-            List<String> cmds = new ArrayList<>();
-
-            // 0. Grant WRITE_SECURE_SETTINGS, DUMP, SET_VOLUME_KEY_LONG_PRESS_LISTENER, and READ_TV_LISTINGS
-            cmds.add("pm grant " + pkg + " android.permission.WRITE_SECURE_SETTINGS 2>/dev/null");
-            cmds.add("pm grant " + pkg + " android.permission.DUMP 2>/dev/null");
-            cmds.add("pm grant " + pkg + " android.permission.SET_VOLUME_KEY_LONG_PRESS_LISTENER 2>/dev/null");
-            cmds.add("pm grant " + pkg + " android.permission.READ_TV_LISTINGS 2>/dev/null");
-            cmds.add("appops set " + pkg + " READ_TV_LISTINGS allow 2>/dev/null");
-            cmds.add("settings put global hidden_api_policy 1 2>/dev/null");
-            cmds.add("settings put global hidden_api_policy_p_apps 1 2>/dev/null");
-            cmds.add("settings put global hidden_api_policy_pre_p_apps 1 2>/dev/null");
-
-            // 1. Runtime Location permissions (only if not already granted)
             try {
-                if (c.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
-                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                    cmds.add("pm grant " + pkg + " android.permission.ACCESS_FINE_LOCATION 2>/dev/null");
-                    cmds.add("pm grant " + pkg + " android.permission.ACCESS_COARSE_LOCATION 2>/dev/null");
-                }
-            } catch (Throwable ignored) {
-            }
+                String pkg = c.getPackageName();
+                List<String> cmds = new ArrayList<>();
 
-            // 2. Storage permissions (only if not already granted — avoids Android 11/12 StorageManagerService killUid loop!)
-            try {
-                if (android.os.Build.VERSION.SDK_INT >= 30) {
-                    if (!android.os.Environment.isExternalStorageManager()) {
-                        cmds.add("appops set " + pkg + " MANAGE_EXTERNAL_STORAGE allow 2>/dev/null");
-                    }
-                } else {
-                    if (c.checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
-                            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                        cmds.add("pm grant " + pkg + " android.permission.READ_EXTERNAL_STORAGE 2>/dev/null");
-                        cmds.add("pm grant " + pkg + " android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null");
-                    }
-                }
-            } catch (Throwable ignored) {
-            }
+                // 0. Grant WRITE_SECURE_SETTINGS, DUMP, SET_VOLUME_KEY_LONG_PRESS_LISTENER, and READ_TV_LISTINGS
+                cmds.add("pm grant " + pkg + " android.permission.WRITE_SECURE_SETTINGS 2>/dev/null");
+                cmds.add("pm grant " + pkg + " android.permission.DUMP 2>/dev/null");
+                cmds.add("pm grant " + pkg + " android.permission.SET_VOLUME_KEY_LONG_PRESS_LISTENER 2>/dev/null");
+                cmds.add("pm grant " + pkg + " android.permission.READ_TV_LISTINGS 2>/dev/null");
+                cmds.add("appops set " + pkg + " READ_TV_LISTINGS allow 2>/dev/null");
+                cmds.add("settings put global hidden_api_policy 1 2>/dev/null");
+                cmds.add("settings put global hidden_api_policy_p_apps 1 2>/dev/null");
+                cmds.add("settings put global hidden_api_policy_pre_p_apps 1 2>/dev/null");
 
-            try {
-                if (android.os.Build.VERSION.SDK_INT < 26 || !c.getPackageManager().canRequestPackageInstalls()) {
-                    cmds.add("appops set " + pkg + " REQUEST_INSTALL_PACKAGES allow 2>/dev/null");
-                }
-            } catch (Throwable ignored) {
-            }
-            cmds.add("appops set " + pkg + " GET_USAGE_STATS allow 2>/dev/null");
-            cmds.add("appops set " + pkg + " ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null");
-
-            // 3. Notification Listener & MediaSession access (both cmd notification allow_listener and
-            // enabled_notification_listeners setting, so low-RAM Android TVs also allow MediaSessionManager!)
-            cmds.add("pm grant " + pkg + " android.permission.MEDIA_CONTENT_CONTROL 2>/dev/null");
-            if (!MediaWatchService.granted(c)) {
-                cmds.add("cmd notification allow_listener " + pkg + "/" + pkg + ".MediaWatchService 2>/dev/null");
-                String ourNotif = pkg + "/" + pkg + ".MediaWatchService";
-                String curNotif = "";
+                // 1. Runtime Location permissions (only if not already granted)
                 try {
-                    curNotif = Settings.Secure.getString(c.getContentResolver(), "enabled_notification_listeners");
+                    if (c.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
+                            != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                        cmds.add("pm grant " + pkg + " android.permission.ACCESS_FINE_LOCATION 2>/dev/null");
+                        cmds.add("pm grant " + pkg + " android.permission.ACCESS_COARSE_LOCATION 2>/dev/null");
+                    }
                 } catch (Throwable ignored) {
                 }
-                String newNotif = (curNotif == null || curNotif.trim().isEmpty() || "null".equalsIgnoreCase(curNotif.trim()))
-                        ? ourNotif
-                        : (curNotif.contains(ourNotif) ? curNotif : (curNotif + ":" + ourNotif));
-                cmds.add("settings put secure enabled_notification_listeners '" + newNotif + "'");
-            }
 
-            // 4. Accessibility Service (never toggle accessibility_enabled 0, only update if needed)
-            String existingAcc = "";
-            try {
-                existingAcc = Settings.Secure.getString(c.getContentResolver(), "enabled_accessibility_services");
-            } catch (Exception ignored) {
-            }
-            String newAcc = buildCleanAccessibilityServicesList(c, existingAcc);
-            cmds.add("settings put secure enabled_accessibility_services '" + newAcc + "'");
-            cmds.add("settings put secure accessibility_enabled 1");
-
-            // 5. Default Home Role + Preferred Home Activity (compatible with Android 9, 10, 11, 12, 14)
-            cmds.add("cmd role add-role-holder --user 0 android.app.role.HOME " + pkg + " 1 2>/dev/null");
-            cmds.add("cmd role add-role-holder --user 0 android.app.role.HOME " + pkg + " 2>/dev/null");
-            cmds.add("cmd package set-home-activity --user 0 " + pkg + "/" + pkg + ".MainActivity 2>/dev/null");
-            cmds.add("cmd package set-home-activity --user 0 " + pkg + "/.MainActivity 2>/dev/null");
-            cmds.add("cmd package set-home-activity " + pkg + "/" + pkg + ".MainActivity 2>/dev/null");
-            cmds.add("pm set-home-activity --user 0 " + pkg + "/" + pkg + ".MainActivity 2>/dev/null");
-
-            // 6. If Secure Mode (closeAdbAfter) was requested, close ADB right at the end of setup
-            if (closeAdbAfter) {
-                cmds.add("settings put global adb_enabled 0 2>/dev/null");
-            }
-
-            String[] hosts = {"127.0.0.1", localLanIp()};
-            Exception lastErr = null;
-            for (String h : hosts) {
-                if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 800)) continue;
+                // 2. Storage permissions (only if not already granted — avoids Android 11/12 StorageManagerService killUid loop!)
                 try {
-                    runShellCommandsOnHost(c, h, 5555, cmds, null);
-                    setPaired(c, true);
-                    repairPermissionsViaSecureSettings(c);
-                    ensureKeepAliveWatchdog(c);
-                    if (closeAdbAfter || getAdbMode(c) == ADB_MODE_SECURE_CLOSE) {
-                        try { Thread.sleep(350L); } catch (InterruptedException ignored) { }
-                        portReachable = false;
+                    if (android.os.Build.VERSION.SDK_INT >= 30) {
+                        if (!android.os.Environment.isExternalStorageManager()) {
+                            cmds.add("appops set " + pkg + " MANAGE_EXTERNAL_STORAGE allow 2>/dev/null");
+                        }
                     } else {
-                        portReachable = true;
+                        if (c.checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                            cmds.add("pm grant " + pkg + " android.permission.READ_EXTERNAL_STORAGE 2>/dev/null");
+                            cmds.add("pm grant " + pkg + " android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null");
+                        }
                     }
-                    if (PowerService.instance != null) {
-                        PowerService.instance.syncVolumeHoldFix();
+                } catch (Throwable ignored) {
+                }
+
+                try {
+                    if (android.os.Build.VERSION.SDK_INT < 26 || !c.getPackageManager().canRequestPackageInstalls()) {
+                        cmds.add("appops set " + pkg + " REQUEST_INSTALL_PACKAGES allow 2>/dev/null");
                     }
-                    if (cb != null) cb.onResult(true, closeAdbAfter ? "CLOSED_ADB" : null);
+                } catch (Throwable ignored) {
+                }
+                cmds.add("appops set " + pkg + " GET_USAGE_STATS allow 2>/dev/null");
+                cmds.add("appops set " + pkg + " ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null");
+
+                // 3. Notification Listener & MediaSession access (both cmd notification allow_listener and
+                // enabled_notification_listeners setting, so low-RAM Android TVs also allow MediaSessionManager!)
+                cmds.add("pm grant " + pkg + " android.permission.MEDIA_CONTENT_CONTROL 2>/dev/null");
+                if (!MediaWatchService.granted(c)) {
+                    cmds.add("cmd notification allow_listener " + pkg + "/" + pkg + ".MediaWatchService 2>/dev/null");
+                    String ourNotif = pkg + "/" + pkg + ".MediaWatchService";
+                    String curNotif = "";
+                    try {
+                        curNotif = Settings.Secure.getString(c.getContentResolver(), "enabled_notification_listeners");
+                    } catch (Throwable ignored) {
+                    }
+                    String newNotif = (curNotif == null || curNotif.trim().isEmpty() || "null".equalsIgnoreCase(curNotif.trim()))
+                            ? ourNotif
+                            : (curNotif.contains(ourNotif) ? curNotif : (curNotif + ":" + ourNotif));
+                    cmds.add("settings put secure enabled_notification_listeners '" + newNotif + "'");
+                }
+
+                // 4. Accessibility Service (never toggle accessibility_enabled 0, only update if needed)
+                String existingAcc = "";
+                try {
+                    existingAcc = Settings.Secure.getString(c.getContentResolver(), "enabled_accessibility_services");
+                } catch (Exception ignored) {
+                }
+                String newAcc = buildCleanAccessibilityServicesList(c, existingAcc);
+                cmds.add("settings put secure enabled_accessibility_services '" + newAcc + "'");
+                cmds.add("settings put secure accessibility_enabled 1");
+
+                // 5. Default Home Role + Preferred Home Activity (compatible with Android 9, 10, 11, 12, 14)
+                cmds.add("cmd role add-role-holder --user 0 android.app.role.HOME " + pkg + " 1 2>/dev/null");
+                cmds.add("cmd role add-role-holder --user 0 android.app.role.HOME " + pkg + " 2>/dev/null");
+                cmds.add("cmd package set-home-activity --user 0 " + pkg + "/" + pkg + ".MainActivity 2>/dev/null");
+                cmds.add("cmd package set-home-activity --user 0 " + pkg + "/.MainActivity 2>/dev/null");
+                cmds.add("cmd package set-home-activity " + pkg + "/" + pkg + ".MainActivity 2>/dev/null");
+                cmds.add("pm set-home-activity --user 0 " + pkg + "/" + pkg + ".MainActivity 2>/dev/null");
+
+                // 6. If Secure Mode (closeAdbAfter) was requested, close ADB right at the end of setup
+                if (closeAdbAfter) {
+                    cmds.add("settings put global adb_enabled 0 2>/dev/null");
+                }
+
+                // Connect to the first reachable host/port only so we NEVER trigger a second RSA key prompt!
+                String[] hosts = {"127.0.0.1", localLanIp()};
+                String targetHost = null;
+                int targetPort = -1;
+                for (String h : hosts) {
+                    if (h == null || h.isEmpty()) continue;
+                    int p = resolveOpenPort(c, h, 800);
+                    if (p > 0) {
+                        targetHost = h;
+                        targetPort = p;
+                        break;
+                    }
+                }
+
+                Exception lastErr = null;
+                if (targetHost != null && targetPort > 0) {
+                    try {
+                        runShellCommandsOnHost(c, targetHost, targetPort, cmds, null);
+                        setPaired(c, true);
+                        repairPermissionsViaSecureSettings(c);
+                        setupGrantInProgress = false;
+                        ensureKeepAliveWatchdog(c);
+                        if (closeAdbAfter || getAdbMode(c) == ADB_MODE_SECURE_CLOSE) {
+                            try { Thread.sleep(350L); } catch (InterruptedException ignored) { }
+                            portReachable = false;
+                        } else {
+                            portReachable = true;
+                        }
+                        if (PowerService.instance != null) {
+                            PowerService.instance.syncVolumeHoldFix();
+                        }
+                        if (cb != null) cb.onResult(true, closeAdbAfter ? "CLOSED_ADB" : null);
+                        return;
+                    } catch (Exception e) {
+                        lastErr = e;
+                    }
+                }
+
+                // If ADB port is already closed, check if WRITE_SECURE_SETTINGS is already granted!
+                if (hasWriteSecureSettings(c) && repairPermissionsViaSecureSettings(c)) {
+                    setupGrantInProgress = false;
+                    ensureKeepAliveWatchdog(c);
+                    if (cb != null) cb.onResult(true, "SECURE_SETTINGS");
                     return;
-                } catch (Exception e) {
-                    lastErr = e;
                 }
-            }
 
-            // If ADB port is already closed, check if WRITE_SECURE_SETTINGS is already granted!
-            if (hasWriteSecureSettings(c) && repairPermissionsViaSecureSettings(c)) {
-                ensureKeepAliveWatchdog(c);
-                if (cb != null) cb.onResult(true, "SECURE_SETTINGS");
-                return;
-            }
-
-            if (cb != null) {
-                if (lastErr != null) {
-                    cb.onResult(false, lastErr.getMessage());
-                } else {
-                    cb.onResult(false, "PORT_CLOSED");
+                if (cb != null) {
+                    if (lastErr != null) {
+                        cb.onResult(false, lastErr.getMessage());
+                    } else {
+                        cb.onResult(false, "PORT_CLOSED");
+                    }
                 }
+            } finally {
+                setupGrantInProgress = false;
             }
         }, "local-adb").start();
     }
@@ -984,9 +1130,10 @@ final class LocalAdb {
             Exception lastErr = null;
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 800)) continue;
+                int port = resolveOpenPort(c, h, 800);
+                if (port <= 0) continue;
                 try {
-                    runShellCommandsOnHost(c, h, 5555, cmds, null);
+                    runShellCommandsOnHost(c, h, port, cmds, null);
                     portReachable = true;
                     setPaired(c, true);
                     // On Android 11 TVs where the OS still ignores ROLE_HOME, also enable Home Button Fix if Accessibility is ready
@@ -1017,12 +1164,6 @@ final class LocalAdb {
     /**
      * Revokes Device Admin, Accessibility, Notification Listener, and Default Home cleanly
      * so the user can uninstall the app on any TV without crashing the app process or locking out ADB on Android 9.
-     *
-     * IMPORTANT (Android 9 fix):
-     * - Never run `pm revoke` on runtime permissions of our own live UID process (Android 9 PackageManagerService
-     *   immediately calls `killUid("permissions revoked")`, crashing the app to the home screen and wedging the open ADB socket).
-     * - Never call `PowerService.instance.disableSelf()` while ADB is running (on Android 9 it can lock out re-enabling).
-     * - Instead, update `enabled_accessibility_services` cleanly via `WRITE_SECURE_SETTINGS` or `settings put secure`.
      */
     static void revokeAllPermissions(Context c, Callback cb) {
         if (c == null) {
@@ -1089,7 +1230,7 @@ final class LocalAdb {
         }
 
         final boolean localUpdated = updatedInProcess;
-        // 4. Also run non-destructive ADB cleanup commands if port 5555 is open (NO `pm revoke` so Android 9 never kills the app!)
+        // 4. Also run non-destructive ADB cleanup commands if ADB port is open (NO `pm revoke` so Android 9 never kills the app!)
         new Thread(() -> {
             List<String> cmds = new ArrayList<>();
             cmds.add("settings put secure enabled_accessibility_services '" + cleanAccStr + "'");
@@ -1104,9 +1245,10 @@ final class LocalAdb {
             boolean adbRan = false;
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 600)) continue;
+                int port = resolveOpenPort(appCtx, h, 600);
+                if (port <= 0) continue;
                 try {
-                    runShellCommandsOnHost(appCtx, h, 5555, cmds, null);
+                    runShellCommandsOnHost(appCtx, h, port, cmds, null);
                     adbRan = true;
                     break;
                 } catch (Exception ignored) { }
@@ -1128,9 +1270,10 @@ final class LocalAdb {
             String[] hosts = {"127.0.0.1", localLanIp()};
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 400)) continue;
+                int port = resolveOpenPort(c, h, 400);
+                if (port <= 0) continue;
                 try {
-                    runShellCommand(c, h, 5555, sb.toString());
+                    runShellCommand(c, h, port, sb.toString());
                     return;
                 } catch (Exception ignored) {
                 }
@@ -1147,9 +1290,10 @@ final class LocalAdb {
             String[] hosts = {"127.0.0.1", localLanIp()};
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 400)) continue;
+                int port = resolveOpenPort(c, h, 400);
+                if (port <= 0) continue;
                 try {
-                    runShellCommand(c, h, 5555, cmd);
+                    runShellCommand(c, h, port, cmd);
                     return;
                 } catch (Exception ignored) {
                 }
@@ -1165,14 +1309,34 @@ final class LocalAdb {
             String[] hosts = {"127.0.0.1", localLanIp()};
             for (String h : hosts) {
                 if (h == null || h.isEmpty()) continue;
-                if (!isPortOpen(h, 5555, 350)) continue;
+                int port = resolveOpenPort(c, h, 350);
+                if (port <= 0) continue;
                 try {
-                    runShellCommand(c, h, 5555, cmd);
+                    runShellCommand(c, h, port, cmd);
                     return;
                 } catch (Exception ignored) {
                 }
             }
         }, "local-adb-keyevent").start();
+        return true;
+    }
+
+    static boolean sendLongPressKeyEventViaAdbAsync(Context c, int keyCode) {
+        if (c == null || getAdbMode(c) == ADB_MODE_SECURE_CLOSE || keyCode <= 0 || !isPaired(c)) return false;
+        new Thread(() -> {
+            String cmd = "input keyevent --longpress " + keyCode;
+            String[] hosts = {"127.0.0.1", localLanIp()};
+            for (String h : hosts) {
+                if (h == null || h.isEmpty()) continue;
+                int port = resolveOpenPort(c, h, 350);
+                if (port <= 0) continue;
+                try {
+                    runShellCommand(c, h, port, cmd);
+                    return;
+                } catch (Exception ignored) {
+                }
+            }
+        }, "local-adb-longpress").start();
         return true;
     }
 
@@ -1185,9 +1349,10 @@ final class LocalAdb {
         Exception lastErr = null;
         for (String h : hosts) {
             if (h == null || h.isEmpty()) continue;
-            if (!isPortOpen(h, 5555, 600)) continue;
+            int port = resolveOpenPort(c, h, 600);
+            if (port <= 0) continue;
             try {
-                String out = runShellCommandOutput(c, h, 5555, shellCmd);
+                String out = runShellCommandOutput(c, h, port, shellCmd);
                 portReachable = true;
                 setPaired(c, true);
                 return out;
@@ -1207,9 +1372,10 @@ final class LocalAdb {
         String[] hosts = {"127.0.0.1", localLanIp()};
         for (String h : hosts) {
             if (h == null || h.isEmpty()) continue;
-            if (!isPortOpen(h, 5555, 600)) continue;
+            int port = resolveOpenPort(c, h, 600);
+            if (port <= 0) continue;
             try {
-                runShellCommandsOnHost(c, h, 5555, commands, progress);
+                runShellCommandsOnHost(c, h, port, commands, progress);
                 portReachable = true;
                 setPaired(c, true);
                 return true;
@@ -1220,10 +1386,14 @@ final class LocalAdb {
     }
 
     static boolean isAdbPortCurrentlyOpen() {
+        return isAdbPortCurrentlyOpen(keepAliveAppCtx);
+    }
+
+    static boolean isAdbPortCurrentlyOpen(Context c) {
         String[] hosts = {"127.0.0.1", localLanIp()};
         for (String h : hosts) {
             if (h == null || h.isEmpty()) continue;
-            if (isPortOpen(h, 5555, 450)) {
+            if (resolveOpenPort(c, h, 450) > 0) {
                 portReachable = true;
                 return true;
             }
@@ -1364,7 +1534,7 @@ final class LocalAdb {
                 DataInputStream in = new DataInputStream(socket.getInputStream());
                 OutputStream out = socket.getOutputStream();
 
-                byte[] banner = "host::\0".getBytes(StandardCharsets.UTF_8);
+                byte[] banner = "host::tvoslauncher\0".getBytes(StandardCharsets.UTF_8);
                 sendPacket(out, A_CNXN, A_VERSION, MAX_PAYLOAD, banner);
 
                 boolean sentSignature = false;
@@ -1434,69 +1604,77 @@ final class LocalAdb {
 
     private static List<String> runShellCommandsOnHost(
             Context c, String host, int port, List<String> commands, BatchProgressListener progress) throws Exception {
-        KeyPair kp = getOrCreateKeyPair(c);
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 2500);
-            socket.setSoTimeout(35000); // Allow up to 35s for user to tap "Allow USB debugging" on TV
-            DataInputStream in = new DataInputStream(socket.getInputStream());
-            OutputStream out = socket.getOutputStream();
+        synchronized (ADB_SESSION_LOCK) {
+            KeyPair kp = getOrCreateKeyPair(c);
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(host, port), 2500);
+                socket.setSoTimeout(35000); // Allow up to 35s for user to tap "Allow USB debugging" on TV
+                DataInputStream in = new DataInputStream(socket.getInputStream());
+                OutputStream out = socket.getOutputStream();
 
-            // 1. Send CNXN
-            byte[] banner = "host::\0".getBytes(StandardCharsets.UTF_8);
-            sendPacket(out, A_CNXN, A_VERSION, MAX_PAYLOAD, banner);
+                // 1. Send CNXN with consistent host identity so adbd only prompts once for our RSA key
+                byte[] banner = "host::tvoslauncher\0".getBytes(StandardCharsets.UTF_8);
+                sendPacket(out, A_CNXN, A_VERSION, MAX_PAYLOAD, banner);
 
-            boolean sentSignature = false;
-            while (true) {
-                Packet p = readPacket(in);
-                if (p.command == A_CNXN) {
-                    break;
-                } else if (p.command == A_AUTH) {
-                    if (p.arg0 == ADB_AUTH_TOKEN) {
-                        if (!sentSignature) {
-                            sentSignature = true;
-                            byte[] sig = signToken((RSAPrivateKey) kp.getPrivate(), p.data);
-                            sendPacket(out, A_AUTH, ADB_AUTH_SIGNATURE, 0, sig);
-                        } else {
-                            byte[] pubKeyPayload = encodeAndroidRsaPublicKey((RSAPublicKey) kp.getPublic());
-                            sendPacket(out, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, pubKeyPayload);
-                        }
-                    } else {
-                        throw new Exception("Unexpected AUTH arg0: " + p.arg0);
-                    }
-                } else {
-                    throw new Exception("Unexpected ADB response: " + p.command);
-                }
-            }
-
-            socket.setSoTimeout(15000);
-            List<String> outputs = new java.util.ArrayList<>(commands.size());
-            int total = commands.size();
-            for (int i = 0; i < total; i++) {
-                String shellCmd = commands.get(i);
-                int localId = i + 1;
-                byte[] openData = ("shell:" + shellCmd + "\0").getBytes(StandardCharsets.UTF_8);
-                sendPacket(out, A_OPEN, localId, 0, openData);
-
-                StringBuilder sb = new StringBuilder();
+                boolean sentSignature = false;
+                boolean sentPubKey = false;
                 while (true) {
                     Packet p = readPacket(in);
-                    if (p.command == A_WRTE) {
-                        sendPacket(out, A_OKAY, localId, p.arg0, null);
-                        if (p.data != null && p.data.length > 0) {
-                            sb.append(new String(p.data, StandardCharsets.UTF_8));
-                        }
-                    } else if (p.command == A_CLSE) {
-                        sendPacket(out, A_CLSE, localId, p.arg0, null);
+                    if (p.command == A_CNXN) {
+                        saveActiveAdbPort(c, port);
+                        setPaired(c, true);
                         break;
+                    } else if (p.command == A_AUTH) {
+                        if (p.arg0 == ADB_AUTH_TOKEN) {
+                            if (!sentSignature) {
+                                sentSignature = true;
+                                byte[] sig = signToken((RSAPrivateKey) kp.getPrivate(), p.data);
+                                sendPacket(out, A_AUTH, ADB_AUTH_SIGNATURE, 0, sig);
+                            } else if (!sentPubKey) {
+                                sentPubKey = true;
+                                byte[] pubKeyPayload = encodeAndroidRsaPublicKey((RSAPublicKey) kp.getPublic());
+                                sendPacket(out, A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, pubKeyPayload);
+                            } else {
+                                throw new Exception("ADB_AUTH_REJECTED");
+                            }
+                        } else {
+                            throw new Exception("Unexpected AUTH arg0: " + p.arg0);
+                        }
+                    } else {
+                        throw new Exception("Unexpected ADB response: " + p.command);
                     }
                 }
-                String outStr = sb.toString();
-                outputs.add(outStr);
-                if (progress != null) {
-                    progress.onStep(i + 1, total, shellCmd, outStr);
+
+                socket.setSoTimeout(15000);
+                List<String> outputs = new java.util.ArrayList<>(commands.size());
+                int total = commands.size();
+                for (int i = 0; i < total; i++) {
+                    String shellCmd = commands.get(i);
+                    int localId = i + 1;
+                    byte[] openData = ("shell:" + shellCmd + "\0").getBytes(StandardCharsets.UTF_8);
+                    sendPacket(out, A_OPEN, localId, 0, openData);
+
+                    StringBuilder sb = new StringBuilder();
+                    while (true) {
+                        Packet p = readPacket(in);
+                        if (p.command == A_WRTE) {
+                            sendPacket(out, A_OKAY, localId, p.arg0, null);
+                            if (p.data != null && p.data.length > 0) {
+                                sb.append(new String(p.data, StandardCharsets.UTF_8));
+                            }
+                        } else if (p.command == A_CLSE) {
+                            sendPacket(out, A_CLSE, localId, p.arg0, null);
+                            break;
+                        }
+                    }
+                    String outStr = sb.toString();
+                    outputs.add(outStr);
+                    if (progress != null) {
+                        progress.onStep(i + 1, total, shellCmd, outStr);
+                    }
                 }
+                return outputs;
             }
-            return outputs;
         }
     }
 
@@ -1592,7 +1770,7 @@ final class LocalAdb {
 
     private static volatile KeyPair cachedKeyPair;
 
-    private static KeyPair getOrCreateKeyPair(Context c) throws Exception {
+    private static synchronized KeyPair getOrCreateKeyPair(Context c) throws Exception {
         if (cachedKeyPair != null) return cachedKeyPair;
         File privFile = new File(c.getFilesDir(), "adb_rsa.priv");
         File pubFile = new File(c.getFilesDir(), "adb_rsa.pub");

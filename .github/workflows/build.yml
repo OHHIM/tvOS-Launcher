@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BASE_VERSION: "2.1.5"
+  BASE_VERSION: "2.2.5"
 
 jobs:
   build:
