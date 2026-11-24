@@ -15,12 +15,13 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Turns on the TV's own "Audio only" (TCL: TV settings > Sound > Audio only): the panel goes off,
+ * Turns on the TV's own "Audio only" (TCL 32S615: TV settings > Sound > Advanced settings >
+ * Audio only): the panel goes off,
  * the TV stays on and keeps playing sound, and any remote button brings the picture back.
  *
  * There is no command for it, so this does what a person would: presses the remote's Settings key
  * (through Local ADB), then reads the menu through PowerService and clicks "Sound", then
- * "Audio only", then any OK prompt. Labels are matched by text, so it copes with menus laid out a
+ * "Advanced settings", then "Audio only", then any OK prompt. Labels are matched by text, so it copes with menus laid out a
  * little differently. Every screen it sees is written to a short log the settings page can show.
  *
  * Main thread, except where noted.
@@ -37,6 +38,9 @@ final class TclAudioOnly {
             "screen off", "turn off screen", "turn screen off"};
     private static final String[] SOUND = {
             "sound", "audio", "sound settings", "display & sound", "display and sound"};
+    /** Sub-page of Sound that holds Audio only on the TCL 32S615. */
+    private static final String[] ADVANCED = {
+            "advanced settings", "advanced sound settings", "advanced audio settings", "advanced"};
     private static final String[] CONFIRM = {"ok", "yes", "confirm", "start", "android:id/button1"};
 
     private static final long STEP_MS = 450L;
@@ -49,7 +53,7 @@ final class TclAudioOnly {
     private static boolean running;
     private static Done done;
     private static long startedMs, confirmUntilMs;
-    private static boolean clickedSound, clickedAudio, sawSettings;
+    private static boolean clickedSound, clickedAdvanced, clickedAudio, sawSettings;
     private static int scrolls, step;
     private static String lastScreen = "";
     private static final StringBuilder LOG = new StringBuilder();
@@ -74,7 +78,7 @@ final class TclAudioOnly {
         done = callback;
         startedMs = SystemClock.uptimeMillis();
         confirmUntilMs = 0;
-        clickedSound = clickedAudio = sawSettings = false;
+        clickedSound = clickedAdvanced = clickedAudio = sawSettings = false;
         scrolls = step = 0;
         lastScreen = "";
         LOG.setLength(0);
@@ -124,16 +128,26 @@ final class TclAudioOnly {
                 press(audio);
                 clickedAudio = true;
                 confirmUntilMs = now + 2500L;
-            } else if (!clickedSound) {
-                AccessibilityNodeInfo sound = find(roots, SOUND);
-                if (sound != null) {
-                    log("clicking \"" + label(sound) + "\"");
-                    press(sound);
-                    clickedSound = true;
+            } else {
+                AccessibilityNodeInfo next = null;
+                if (!clickedSound) {
+                    next = find(roots, SOUND);
+                    if (next != null) clickedSound = true;
+                } else if (!clickedAdvanced) {
+                    next = find(roots, ADVANCED);
+                    if (next != null) {
+                        clickedAdvanced = true;
+                        scrolls = 0;  // Audio only may need its own scrolling on the new page
+                    }
                 }
-            } else if (scrolls < MAX_SCROLLS) {
-                scrolls++;
-                if (!scrollForward(roots)) adbKey(KeyEvent.KEYCODE_DPAD_DOWN);
+                if (next != null) {
+                    log("clicking \"" + label(next) + "\"");
+                    press(next);
+                } else if (scrolls < MAX_SCROLLS && menuOnScreen(roots)) {
+                    // Only while a TV menu is showing, so a Down press never reaches the player.
+                    scrolls++;
+                    if (!scrollForward(roots)) adbKey(KeyEvent.KEYCODE_DPAD_DOWN);
+                }
             }
         }
         MAIN.postDelayed(TclAudioOnly::poll, STEP_MS);
@@ -144,15 +158,9 @@ final class TclAudioOnly {
         running = false;
         PowerService svc = PowerService.instance;
         if (!ok && svc != null && sawSettings) {
-            // Close the menus this opened; only when a settings screen was seen, so a stray Back
-            // never reaches the video player.
-            int backs = clickedSound ? 2 : 1;
-            for (int i = 0; i < backs; i++) {
-                MAIN.postDelayed(() -> {
-                    PowerService s = PowerService.instance;
-                    if (s != null) s.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
-                }, 150L + i * 350L);
-            }
+            // Close the menus this opened. Each Back is sent only while a menu is still on
+            // screen, so a spare one never reaches the video player.
+            closeMenus((clickedSound ? 1 : 0) + (clickedAdvanced ? 1 : 0) + 1);
         }
         if (svc != null) {
             String text = LOG.length() > 3500 ? LOG.substring(LOG.length() - 3500) : LOG.toString();
@@ -163,7 +171,37 @@ final class TclAudioOnly {
         if (d != null) d.onDone(ok);
     }
 
+    private static void closeMenus(int backsLeft) {
+        if (backsLeft <= 0) return;
+        MAIN.postDelayed(() -> {
+            PowerService s = PowerService.instance;
+            if (s == null || !menuOnScreen(roots(s))) { log("menus closed"); return; }
+            log("back");
+            s.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK);
+            closeMenus(backsLeft - 1);
+        }, 400L);
+    }
+
     // ------------------------------------------------------------ Reading the screen
+
+    /** A TCL or settings menu is on screen. Stricter than isMenuWindow (system UI doesn't count),
+     *  because this decides whether a Back or Down press is safe to send. */
+    private static boolean menuOnScreen(List<AccessibilityNodeInfo> roots) {
+        for (AccessibilityNodeInfo r : roots) {
+            CharSequence p = r.getPackageName();
+            if (p == null || isOwnWindow(r)) continue;
+            String s = p.toString();
+            if ((s.contains("tcl") || s.contains("settings")) && hasVisibleText(r, 0)) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasVisibleText(AccessibilityNodeInfo n, int depth) {
+        if (n == null || depth > 40) return false;
+        if (n.isVisibleToUser() && n.getText() != null && n.getText().length() > 0) return true;
+        for (int i = 0; i < n.getChildCount(); i++) if (hasVisibleText(n.getChild(i), depth + 1)) return true;
+        return false;
+    }
 
     private static List<AccessibilityNodeInfo> roots(PowerService svc) {
         List<AccessibilityNodeInfo> out = new ArrayList<>();

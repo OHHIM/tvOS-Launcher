@@ -165,7 +165,8 @@ final class ScreenOff {
             lastNote = I18n.s(c, "TCL Audio only: opening the menu…", null);
             final Context tclApp = c.getApplicationContext();
             TclAudioOnly.start(svc, ok -> {
-                if (!ok) tclAudioOnly = false;
+                // Even on failure, keep tclAudioOnly set: onKey clears it on the next real remote
+                // press, so a failed try isn't retried every 20 s all night.
                 worker().post(() -> closeAdbPortIfWeOpenedIt(tclApp));
                 lastNote = ok ? I18n.s(svc, "TCL Audio only", null)
                         : I18n.s(svc, "TCL Audio only not found (see the menu log)", null);
